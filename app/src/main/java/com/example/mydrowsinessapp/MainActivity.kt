@@ -15,14 +15,17 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import ai.onnxruntime.*
@@ -36,6 +39,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var ortSession: OrtSession
     private val frameBuffer = ArrayList<FloatArray>(30)
     private var isProcessing = false
+    private var lastPrediction = 0f
+    private var lastPredictionState = false
+    private var lastDebugInfo = ""
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -48,8 +54,13 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         
-        // Initialize ONNX Runtime session
-        initOrtSession()
+        try {
+            val modelBytes = assets.open("mobilevit_model.onnx").readBytes()
+            val env = OrtEnvironment.getEnvironment()
+            ortSession = env.createSession(modelBytes)
+        } catch (e: Exception) {
+            Log.e("MainActivity", "Error loading model: ${e.message}")
+        }
         
         cameraExecutor = Executors.newSingleThreadExecutor()
 
@@ -60,41 +71,87 @@ class MainActivity : ComponentActivity() {
         requestCameraPermission()
     }
 
-    private fun initOrtSession() {
-        try {
-            val ortEnvironment = OrtEnvironment.getEnvironment()
-            val modelBytes = assets.open("mobilevit_model.onnx").readBytes()
-            ortSession = ortEnvironment.createSession(modelBytes)
-        } catch (e: Exception) {
-            Log.e("MainActivity", "Error loading model: ${e.message}")
-        }
-    }
-
     @Composable
     fun DrowsinessDetectionScreen() {
         var isDrowsy by remember { mutableStateOf(false) }
+        var debugInfo by remember { mutableStateOf("Waiting for frames...") }
+        var rawPrediction by remember { mutableStateOf(0f) }
         
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .background(if (isDrowsy) Color.Red else Color.Green),
-            horizontalAlignment = Alignment.CenterHorizontally
+                .background(Color.Black)
         ) {
-            CameraPreview(
-                modifier = Modifier
-                    .weight(1f)
-                    .padding(16.dp)
-            ) { imageProxy ->
-                processFrame(imageProxy) { drowsy ->
-                    isDrowsy = drowsy
+            // Camera Preview (Top Half)
+            Box(modifier = Modifier.weight(1f)) {
+                CameraPreview(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(16.dp)
+                ) { imageProxy ->
+                    processFrame(imageProxy) { drowsy, prediction, info ->
+                        isDrowsy = drowsy
+                        rawPrediction = prediction
+                        debugInfo = info
+                    }
                 }
+                
+                Text(
+                    text = if (isDrowsy) "DROWSY" else "ACTIVE",
+                    color = if (isDrowsy) Color.Red else Color.Green,
+                    fontSize = 24.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(16.dp)
+                )
             }
             
-            Text(
-                text = if (isDrowsy) "You are Drowsy" else "You are Active",
-                modifier = Modifier.padding(16.dp),
-                color = Color.White
-            )
+            // Debug Info (Bottom Half)
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .background(Color.DarkGray)
+                    .padding(16.dp)
+            ) {
+                Text(
+                    text = "Debug Information",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                
+                Text(
+                    text = "Raw Prediction: ${String.format("%.4f", rawPrediction)}",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+                
+                Text(
+                    text = "Status: ${if (isDrowsy) "DROWSY" else "ACTIVE"}",
+                    color = if (isDrowsy) Color.Red else Color.Green,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+                
+                Text(
+                    text = "Processing Info:",
+                    color = Color.White,
+                    fontSize = 16.sp,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                
+                Text(
+                    text = debugInfo,
+                    color = Color.LightGray,
+                    fontSize = 14.sp,
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .verticalScroll(rememberScrollState())
+                )
+            }
         }
     }
 
@@ -148,48 +205,65 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun processFrame(imageProxy: ImageProxy, onResult: (Boolean) -> Unit) {
-        if (isProcessing || frameBuffer.size >= 30) return
-        
+    private fun processFrame(imageProxy: ImageProxy, onResult: (Boolean, Float, String) -> Unit) {
+        if (isProcessing) {
+            onResult(lastPredictionState, lastPrediction, lastDebugInfo)
+            return
+        }
+
         val processedFrame = ImageProcessor.preprocessFrame(imageProxy)
         frameBuffer.add(processedFrame)
         
         if (frameBuffer.size == 30) {
+            val debugInfo = StringBuilder()
+            debugInfo.append("Frame buffer size: ${frameBuffer.size}/30\n")
+            
             isProcessing = true
-            CoroutineScope(Dispatchers.Default).launch {
-                try {
-                    // Prepare input tensor
-                    val shape = longArrayOf(1, 30, 3, 256, 256)
-                    val flattenedInput = FloatArray(30 * 3 * 256 * 256)
-                    var idx = 0
-                    for (frame in frameBuffer) {
-                        System.arraycopy(frame, 0, flattenedInput, idx, frame.size)
-                        idx += frame.size
-                    }
-
-                    val inputTensor = OnnxTensor.createTensor(
-                        OrtEnvironment.getEnvironment(),
-                        FloatBuffer.wrap(flattenedInput),
-                        shape
-                    )
-
-                    // Run inference
-                    val output = ortSession.run(mapOf("input" to inputTensor))
-                    val outputTensor = output[0].value as Array<FloatArray>
-                    val prediction = 1.0f / (1.0f + Math.exp(-outputTensor[0][0].toDouble())).toFloat()
-                    
-                    withContext(Dispatchers.Main) {
-                        onResult(prediction >= 0.5f)
-                    }
-                    
-                    frameBuffer.clear()
-                    isProcessing = false
-                } catch (e: Exception) {
-                    Log.e("MainActivity", "Error running model: ${e.message}")
-                    frameBuffer.clear()
-                    isProcessing = false
+            try {
+                debugInfo.append("Preparing input tensor...\n")
+                val shape = longArrayOf(1L, 30L, 3L, ImageProcessor.TARGET_SIZE.toLong(), ImageProcessor.TARGET_SIZE.toLong())
+                val flattenedInput = FloatArray(30 * 3 * ImageProcessor.TARGET_SIZE * ImageProcessor.TARGET_SIZE)
+                var idx = 0
+                for (frame in frameBuffer) {
+                    System.arraycopy(frame, 0, flattenedInput, idx, frame.size)
+                    idx += frame.size
                 }
+
+                OrtEnvironment.getEnvironment().use { env ->
+                    OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedInput), shape).use { inputTensor ->
+                        debugInfo.append("Running inference...\n")
+                        val output = ortSession.run(mapOf("input_frames" to inputTensor))
+                        val outputTensor = output[0].value as Array<FloatArray>
+                        val logit = outputTensor[0][0]
+                        
+                        // Apply sigmoid to get probability (exactly as in training)
+                        val prediction = 1.0f / (1.0f + Math.exp(-logit.toDouble())).toFloat()
+                        val isDrowsy = prediction >= 0.5f  // Same threshold as training
+                        
+                        debugInfo.append("Raw model output (logit): $logit\n")
+                        debugInfo.append("Sigmoid prediction: $prediction\n")
+                        debugInfo.append("Threshold: 0.5\n")
+                        debugInfo.append("State: ${if (isDrowsy) "DROWSY (3AM)" else "ACTIVE (10AM)"}\n")
+                        
+                        // Update last prediction values
+                        lastPrediction = prediction
+                        lastPredictionState = isDrowsy
+                        lastDebugInfo = debugInfo.toString()
+                        
+                        onResult(lastPredictionState, lastPrediction, lastDebugInfo)
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("MainActivity", "Error running model: ${e.message}")
+                debugInfo.append("Error: ${e.message}\n")
+                lastDebugInfo = debugInfo.toString()
+                onResult(lastPredictionState, lastPrediction, lastDebugInfo)
+            } finally {
+                frameBuffer.clear()
+                isProcessing = false
             }
+        } else {
+            onResult(lastPredictionState, lastPrediction, lastDebugInfo)
         }
     }
 
